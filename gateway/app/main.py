@@ -1,9 +1,12 @@
-"""Edge gateway: proxies requests to the currently routed upstream and
-exposes the operations API + web console for on-duty target switching."""
+"""Edge gateway: proxies requests to the currently routed upstream under a
+per-target concurrency quota, and exposes the operations API + web console
+for on-duty target switching."""
 from __future__ import annotations
 
+import asyncio
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -15,6 +18,12 @@ from pydantic import BaseModel, Field
 from . import db
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+# How long a request may wait for a quota slot before being answered "busy".
+WAIT_TIMEOUT_SECONDS = float(os.environ.get("WAIT_TIMEOUT_SECONDS", "5.0"))
+# Poll granularity for retrying admission; a committed switch is picked up
+# by waiting requests within this interval.
+WAIT_POLL_SECONDS = float(os.environ.get("WAIT_POLL_SECONDS", "0.05"))
 
 
 def parse_upstreams() -> dict[str, str]:
@@ -60,6 +69,7 @@ def health():
 def state():
     s = db.get_state()
     s["boot"] = app.state.boot_info
+    s["wait_timeout_seconds"] = WAIT_TIMEOUT_SECONDS
     return s
 
 
@@ -70,13 +80,47 @@ class CallRequest(BaseModel):
 
 @app.post("/api/call")
 async def call(req: CallRequest):
-    """Admit a request and proxy it to the upstream that is current *at
-    admission time*. The full upstream response is fetched from that original
-    target even if a switch commits while the request is in flight."""
+    """Admit a request under the current target's quota, then proxy it.
+
+    A quota slot of the *current* route target must be secured before the
+    request is registered in-flight. While waiting for a slot, a committed
+    switch makes the request immediately compete for the new target's quota
+    instead; once admitted, the full response is fetched from the original
+    (admission-time) target even if a switch commits later. If no slot
+    frees up within WAIT_TIMEOUT_SECONDS the request is answered "busy"
+    and is never forwarded.
+    """
     path = req.path if req.path.startswith("/") else "/work"
     if "://" in path or ".." in path:
         return JSONResponse(status_code=400, content={"ok": False, "error": "bad_path"})
-    admission = db.admit(path)
+    waiter_id = uuid.uuid4().hex
+    queued_since = time.monotonic()
+    deadline = queued_since + WAIT_TIMEOUT_SECONDS
+    admission: dict
+    try:
+        while True:
+            attempt = db.try_admit(waiter_id, path)
+            if attempt["admitted"]:
+                admission = attempt
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "ok": False,
+                        "error": "busy",
+                        "target": attempt["target"],
+                        "capacity": attempt["capacity"],
+                        "waited_ms": int((time.monotonic() - queued_since) * 1000),
+                        "detail": "目标名额已满，等候超时，请求未转发",
+                    },
+                )
+            await asyncio.sleep(min(WAIT_POLL_SECONDS, remaining))
+    finally:
+        db.waiter_done(waiter_id)
+
+    queue_ms = int((time.monotonic() - queued_since) * 1000)
     target_url = db.upstream_url(admission["target"])
     started = time.monotonic()
     try:
@@ -92,6 +136,8 @@ async def call(req: CallRequest):
             "request_id": admission["id"],
             "target": admission["target"],
             "route_version": admission["version"],
+            "capacity": admission["capacity"],
+            "queue_ms": queue_ms,
             "duration_ms": int((time.monotonic() - started) * 1000),
             "upstream": body,
         }
@@ -108,6 +154,23 @@ async def call(req: CallRequest):
         )
     finally:
         db.finish(admission["id"])
+
+
+class CapacityRequest(BaseModel):
+    capacity: int = Field(ge=db.MIN_CAPACITY, le=db.MAX_CAPACITY)
+
+
+@app.post("/api/upstreams/{name}/capacity")
+def set_capacity(name: str, req: CapacityRequest):
+    """Set one upstream's concurrency quota (1..5). Takes effect for future
+    admissions at once; in-flight requests are never interrupted, and a
+    lowered quota does not make a drained-looking target offlinable any
+    earlier — only a truly empty in-flight count does."""
+    res = db.set_capacity(name, req.capacity)
+    if not res["ok"]:
+        code = 404 if res["error"] == "unknown_target" else 400
+        return JSONResponse(status_code=code, content=res)
+    return res
 
 
 class ProbeRequest(BaseModel):

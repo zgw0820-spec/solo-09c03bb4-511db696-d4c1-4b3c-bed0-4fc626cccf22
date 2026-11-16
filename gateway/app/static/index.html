@@ -26,11 +26,14 @@
   .badge.cur { background: #1f9d55; color: #fff; }
   .badge.draining { background: #e8a13a; color: #fff; }
   .badge.offlinable { background: #607d8b; color: #fff; }
+  .badge.full { background: #b3261e; color: #fff; }
+  .badge.free { background: #dde5ec; color: #33424f; }
   button { padding: 6px 14px; border: 0; border-radius: 6px; background: #1266a8;
            color: #fff; cursor: pointer; font-size: 14px; }
   button:disabled { background: #9db4c6; cursor: not-allowed; }
   button.warn { background: #c25e1d; }
   input, select { padding: 5px 8px; border: 1px solid #b9c4cf; border-radius: 6px; font-size: 14px; }
+  select.cap { padding: 2px 4px; }
   ul { margin: 8px 0 0; padding-left: 18px; font-size: 13px; max-height: 220px; overflow-y: auto; }
   .msg { margin-top: 8px; font-size: 14px; min-height: 20px; }
   .msg.ok { color: #1f7a3d; }
@@ -38,6 +41,7 @@
   .muted { color: #6b7a89; font-size: 12px; }
   #req-log li.done { color: #1f7a3d; }
   #req-log li.fail { color: #b3261e; }
+  #req-log li.busy { color: #c25e1d; }
 </style>
 </head>
 <body>
@@ -49,9 +53,10 @@
   <section>
     <h2>发起转发请求</h2>
     <label>响应延迟(ms) <input id="delay" type="number" value="3000" min="0" max="60000" style="width:90px"></label>
+    <label>并发数 <input id="conc" type="number" value="5" min="1" max="50" style="width:70px"></label>
     <button onclick="fire(1)">发送 1 个</button>
-    <button onclick="fire(5)">并发 5 个</button>
-    <span class="muted">请求在接纳时绑定当时的目标，切换后仍从原上游取回完整响应</span>
+    <button onclick="fireN()">并发 N 个</button>
+    <div class="muted">名额占满的请求最多等候 5 秒，超时返回“忙碌”且不转发；等候期间若确认切换，立即改向新目标争取名额</div>
     <ul id="req-log"></ul>
   </section>
 
@@ -69,16 +74,19 @@
   </section>
 
   <section>
-    <h2>上游与在途数</h2>
+    <h2>上游名额与负载</h2>
     <table>
-      <thead><tr><th>名称</th><th>地址</th><th>角色</th><th>在途</th><th>状态</th></tr></thead>
+      <thead><tr><th>名称</th><th>地址</th><th>名额(1-5)</th><th>在途</th><th>等候</th><th>角色</th><th>状态</th></tr></thead>
       <tbody id="upstream-body"></tbody>
     </table>
+    <div class="muted">调低名额不打断在途请求；旧目标在途清零前不会提示可下线</div>
   </section>
 
   <section>
     <h2>在途请求明细</h2>
     <ul id="inflight-list"></ul>
+    <h2 style="margin-top:14px">等候名额的请求</h2>
+    <ul id="waiting-list"></ul>
   </section>
 </main>
 
@@ -111,7 +119,9 @@ async function refresh() {
 
 function render() {
   const r = state.route;
+  const totalWait = state.upstreams.reduce((a, u) => a + u.waiting, 0);
   let html = `当前目标 <b>${esc(r.current_target)}</b> · 路由版号 <b>v${r.version}</b> · ` +
+             `总在途 <b>${state.inflight.length}</b> · 等候 <b>${totalWait}</b> · ` +
              `更新于 ${new Date(r.updated_at * 1000).toLocaleTimeString()}`;
   if (state.boot && state.boot.cleared_inflight)
     html += ` · 本次启动已清理中断在途 ${state.boot.cleared_inflight} 条`;
@@ -122,8 +132,14 @@ function render() {
     if (u.is_current)      { cls = 'cur';        badge = '<span class="badge cur">当前目标</span>'; }
     else if (u.inflight>0) { cls = 'draining';   badge = `<span class="badge draining">旧目标 · 排空中</span>`; }
     else                   { cls = 'offlinable'; badge = '<span class="badge offlinable">旧目标 · 在途已清零，可下线 ✓</span>'; }
+    const load = u.full ? '<span class="badge full">名额已满</span>'
+                        : `<span class="badge free">余 ${u.capacity - u.inflight}</span>`;
+    const opts = [1,2,3,4,5].map(n =>
+      `<option value="${n}"${n === u.capacity ? ' selected' : ''}>${n}</option>`).join('');
     return `<tr class="${cls}"><td>${esc(u.name)}</td><td>${esc(u.url)}</td>` +
-           `<td>${u.is_current ? '当前' : '旧'}</td><td>${u.inflight}</td><td>${badge}</td></tr>`;
+           `<td><select class="cap" onchange="setCap('${esc(u.name)}', this.value)">${opts}</select></td>` +
+           `<td>${u.inflight}</td><td>${u.waiting}</td>` +
+           `<td>${u.is_current ? '当前' : '旧'}</td><td>${badge} ${load}</td></tr>`;
   }).join('');
 
   const sel = $('candidate');
@@ -135,6 +151,10 @@ function render() {
   $('inflight-list').innerHTML = state.inflight.map(x =>
     `<li>#${x.id.slice(0,8)} → <b>${esc(x.target)}</b> ${esc(x.path)} · 已进行 ${x.age_ms}ms</li>`
   ).join('') || '<li class="muted">（无在途请求）</li>';
+
+  $('waiting-list').innerHTML = (state.waiting || []).map(x =>
+    `<li>#${x.id.slice(0,8)} 等 <b>${esc(x.target)}</b> 的名额 · 已等 ${x.age_ms}ms</li>`
+  ).join('') || '<li class="muted">（无等候请求）</li>';
 
   $('probe-log').innerHTML = state.recent_probes.map(p =>
     `<li>${new Date(p.created_at*1000).toLocaleTimeString()} 探测 <b>${esc(p.target)}</b> ` +
@@ -153,6 +173,21 @@ function updateSwitchPanel() {
   btn.disabled = !(lastProbe.ok && sameTarget && versionOk);
   hint.textContent = `页面所见版号 v${state.route.version} · 探测基于版号 v${lastProbe.base_version}` +
     (versionOk ? '' : '（版号已变化，请重新探测）');
+}
+
+async function setCap(name, cap) {
+  const { status, body } = await api('POST', `/api/upstreams/${name}/capacity`,
+                                     { capacity: parseInt(cap, 10) });
+  const msg = $('switch-msg');
+  if (status === 200 && body && body.ok) {
+    msg.className = 'msg ok';
+    msg.textContent = `已把 ${name} 名额设为 ${body.capacity}` +
+      (body.inflight > body.capacity ? `（当前在途 ${body.inflight} 超出新名额，不打断，降回前不再接纳新请求）` : '');
+  } else {
+    msg.className = 'msg err';
+    msg.textContent = `名额修改被拒绝：${body && (body.error || body.detail) || status}`;
+  }
+  await refresh();
 }
 
 async function doProbe() {
@@ -183,7 +218,7 @@ async function doCommit() {
   });
   if (status === 200 && body.ok) {
     msg.className = 'msg ok';
-    msg.textContent = `已切换到 ${body.current_target}（新版号 v${body.version}），新请求立即走新目标`;
+    msg.textContent = `已切换到 ${body.current_target}（新版号 v${body.version}），新请求立即走新目标，等候者立即改向新目标争取名额`;
   } else if (status === 409) {
     msg.className = 'msg err';
     msg.textContent = `版号冲突：路由已被他人切换（当前 ${body.current_target} @v${body.current_version}），已刷新，请重新探测`;
@@ -212,7 +247,11 @@ async function fireOne(delay) {
   const li = document.getElementById(id);
   if (body && body.ok) {
     li.className = 'done';
-    li.textContent = `✓ #${body.request_id.slice(0,8)} 由 ${body.target} 完整返回 · 耗时 ${dt}ms · 上游延迟 ${body.upstream.delay_ms}ms`;
+    const queued = body.queue_ms > 50 ? ` · 排队 ${body.queue_ms}ms` : '';
+    li.textContent = `✓ #${body.request_id.slice(0,8)} 由 ${body.target} 完整返回 · 耗时 ${dt}ms${queued} · 上游延迟 ${body.upstream.delay_ms}ms`;
+  } else if (body && body.error === 'busy') {
+    li.className = 'busy';
+    li.textContent = `⏳ 忙碌：${body.target} 名额(${body.capacity})已满，等候 ${body.waited_ms}ms 超时，未转发`;
   } else {
     li.className = 'fail';
     li.textContent = `✗ ${status} ${body && (body.error || '') || ''}`;
@@ -223,6 +262,11 @@ async function fireOne(delay) {
 function fire(n) {
   const d = Math.max(0, parseInt($('delay').value || '0', 10));
   for (let i = 0; i < n; i++) fireOne(d);
+}
+
+function fireN() {
+  const n = Math.max(1, Math.min(50, parseInt($('conc').value || '1', 10)));
+  fire(n);
 }
 
 refresh();

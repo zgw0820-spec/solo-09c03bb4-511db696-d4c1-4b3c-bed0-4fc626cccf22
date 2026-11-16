@@ -1,12 +1,20 @@
 """SQLite persistence for the edge gateway.
 
 Tables:
-  upstreams  - registered upstream targets (seeded from env, upserted on boot)
+  upstreams  - registered upstream targets, each with a concurrency quota
+               (capacity, 1..5). The quota is configuration and persists
+               across restarts; occupancy never does.
   routes     - single-row table holding the effective route and its version
-  inflight   - one row per admitted proxied request; wiped on startup so a
-               restarted gateway never reports interrupted requests as in-flight
+  inflight   - one row per admitted proxied request == one held quota slot;
+               wiped on startup so a restarted gateway neither reports
+               interrupted requests as in-flight nor leaks their quota slots
   probes     - audit log of candidate probes; a commit requires a fresh,
                successful probe recorded against the same route version
+
+Requests that find the current target's quota exhausted are tracked as
+*waiters* in process memory only (never in SQLite): a wait that times out
+leaves no slot held, and a restart clears the waiters together with the
+inflight table, so neither a timeout nor a restart leaves a placeholder.
 """
 from __future__ import annotations
 
@@ -21,8 +29,16 @@ from pathlib import Path
 DB_PATH = Path(os.environ.get("GATEWAY_DB", "/data/gateway.db"))
 PROBE_TTL_SECONDS = float(os.environ.get("PROBE_TTL_SECONDS", "60"))
 
+MIN_CAPACITY = 1
+MAX_CAPACITY = 5
+DEFAULT_CAPACITY = max(
+    MIN_CAPACITY, min(MAX_CAPACITY, int(os.environ.get("DEFAULT_CAPACITY", "3")))
+)
+
 _lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
+# wid -> {"id", "target", "path", "since"}; memory only, never persisted.
+_waiters: dict[str, dict] = {}
 
 
 def _connect() -> sqlite3.Connection:
@@ -47,8 +63,9 @@ def init_db(upstreams: dict[str, str], initial_target: str) -> dict:
         _conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS upstreams (
-                name TEXT PRIMARY KEY,
-                url  TEXT NOT NULL
+                name     TEXT PRIMARY KEY,
+                url      TEXT NOT NULL,
+                capacity INTEGER NOT NULL DEFAULT 3
             );
             CREATE TABLE IF NOT EXISTS routes (
                 id             INTEGER PRIMARY KEY CHECK (id = 1),
@@ -72,11 +89,20 @@ def init_db(upstreams: dict[str, str], initial_target: str) -> dict:
             );
             """
         )
-        for name, url in upstreams.items():
+        # Databases created before quotas existed gain the column; existing
+        # per-target quota settings are kept across restarts.
+        cols = {r["name"] for r in _conn.execute("PRAGMA table_info(upstreams)")}
+        if "capacity" not in cols:
             _conn.execute(
-                "INSERT INTO upstreams (name, url) VALUES (?, ?) "
+                "ALTER TABLE upstreams ADD COLUMN capacity "
+                f"INTEGER NOT NULL DEFAULT {DEFAULT_CAPACITY}"
+            )
+        for name, url in upstreams.items():
+            # Upsert the address only: an operator-set quota survives restarts.
+            _conn.execute(
+                "INSERT INTO upstreams (name, url, capacity) VALUES (?, ?, ?) "
                 "ON CONFLICT(name) DO UPDATE SET url = excluded.url",
-                (name, url),
+                (name, url, DEFAULT_CAPACITY),
             )
         seeded = False
         if _conn.execute("SELECT COUNT(*) AS c FROM routes").fetchone()["c"] == 0:
@@ -86,7 +112,8 @@ def init_db(upstreams: dict[str, str], initial_target: str) -> dict:
                 (initial_target, time.time()),
             )
             seeded = True
-        # Interrupted requests of a previous process must not linger as in-flight.
+        # Interrupted requests of a previous process must not linger as
+        # in-flight, and their quota slots must not stay occupied.
         cleared = _conn.execute("DELETE FROM inflight").rowcount
     return {"seeded_route": seeded, "cleared_inflight": cleared}
 
@@ -112,25 +139,96 @@ def upstream_url(name: str) -> str | None:
     return row["url"] if row else None
 
 
-def admit(path: str) -> dict:
-    """Atomically snapshot the effective route and register the request as
-    in-flight. The request keeps this target even if a switch commits while
-    it is running, so it always completes against the original upstream."""
-    rid = uuid.uuid4().hex
+def try_admit(waiter_id: str, path: str) -> dict:
+    """One atomic admission attempt against the *current* route target.
+
+    Route snapshot, quota check and in-flight registration happen in a
+    single critical section, so admission, quota edits and route switches
+    can never interleave into over-committing a target or pinning a
+    request to a stale target. The request is registered in-flight (thus
+    holding a quota slot) only after a slot of the current route target
+    has actually been secured.
+
+    If the target is full, the attempt is (re)recorded as waiting on that
+    target — in memory only — so a retry after a route switch naturally
+    competes for the new target's quota instead.
+    """
+    now = time.time()
     with _lock, _db() as conn:
         route = conn.execute(
             "SELECT current_target, version FROM routes WHERE id = 1"
         ).fetchone()
-        conn.execute(
-            "INSERT INTO inflight (id, target, path, started_at) VALUES (?, ?, ?, ?)",
-            (rid, route["current_target"], path, time.time()),
-        )
-    return {"id": rid, "target": route["current_target"], "version": route["version"]}
+        target = route["current_target"]
+        cap = conn.execute(
+            "SELECT capacity FROM upstreams WHERE name = ?", (target,)
+        ).fetchone()["capacity"]
+        held = conn.execute(
+            "SELECT COUNT(*) AS c FROM inflight WHERE target = ?", (target,)
+        ).fetchone()["c"]
+        if held < cap:
+            rid = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO inflight (id, target, path, started_at) "
+                "VALUES (?, ?, ?, ?)",
+                (rid, target, path, now),
+            )
+            _waiters.pop(waiter_id, None)
+            return {
+                "admitted": True,
+                "id": rid,
+                "target": target,
+                "version": route["version"],
+                "capacity": cap,
+            }
+        prev = _waiters.get(waiter_id)
+        _waiters[waiter_id] = {
+            "id": waiter_id,
+            "target": target,
+            "path": path,
+            "since": prev["since"] if prev else now,
+        }
+        return {
+            "admitted": False,
+            "target": target,
+            "version": route["version"],
+            "capacity": cap,
+            "held": held,
+        }
+
+
+def waiter_done(waiter_id: str) -> None:
+    """Drop a waiter record (admitted, timed out, or errored)."""
+    with _lock:
+        _waiters.pop(waiter_id, None)
 
 
 def finish(request_id: str) -> None:
     with _lock, _db() as conn:
         conn.execute("DELETE FROM inflight WHERE id = ?", (request_id,))
+
+
+def set_capacity(name: str, capacity: int) -> dict:
+    """Update one target's quota (1..5). Lowering the quota never interrupts
+    in-flight requests: occupancy may stay above the new quota until those
+    requests finish, and no new admission happens until it drops back below.
+    """
+    if not MIN_CAPACITY <= capacity <= MAX_CAPACITY:
+        return {
+            "ok": False,
+            "error": "capacity_out_of_range",
+            "min": MIN_CAPACITY,
+            "max": MAX_CAPACITY,
+        }
+    with _lock, _db() as conn:
+        cur = conn.execute(
+            "UPDATE upstreams SET capacity = ? WHERE name = ?", (capacity, name)
+        )
+        if cur.rowcount != 1:
+            return {"ok": False, "error": "unknown_target"}
+        held = conn.execute(
+            "SELECT COUNT(*) AS c FROM inflight WHERE target = ?", (name,)
+        ).fetchone()["c"]
+    return {"ok": True, "target": name, "capacity": capacity, "inflight": held}
 
 
 def record_probe(target: str, base_version: int, ok: bool, detail: dict) -> dict:
@@ -195,7 +293,10 @@ def get_state() -> dict:
     with _lock:
         route = dict(_db().execute("SELECT * FROM routes WHERE id = 1").fetchone())
         upstreams = [
-            dict(r) for r in _db().execute("SELECT name, url FROM upstreams ORDER BY name")
+            dict(r)
+            for r in _db().execute(
+                "SELECT name, url, capacity FROM upstreams ORDER BY name"
+            )
         ]
         inflight = [
             dict(r) for r in _db().execute("SELECT * FROM inflight ORDER BY started_at")
@@ -206,18 +307,29 @@ def get_state() -> dict:
                 "SELECT * FROM probes ORDER BY created_at DESC LIMIT 10"
             )
         ]
+        waiting = sorted(_waiters.values(), key=lambda w: w["since"])
     counts: dict[str, int] = {}
     for row in inflight:
         counts[row["target"]] = counts.get(row["target"], 0) + 1
+    wait_counts: dict[str, int] = {}
+    for w in waiting:
+        wait_counts[w["target"]] = wait_counts.get(w["target"], 0) + 1
     now = time.time()
     for u in upstreams:
         u["inflight"] = counts.get(u["name"], 0)
+        u["waiting"] = wait_counts.get(u["name"], 0)
         u["is_current"] = u["name"] == route["current_target"]
+        # At/over quota: no further admission until occupancy drops below.
+        u["full"] = u["inflight"] >= u["capacity"]
         # A non-current target may only be taken offline once its in-flight
-        # requests have fully drained.
+        # requests have fully drained — never earlier, e.g. not merely
+        # because its quota was lowered or the route moved away.
         u["can_offline"] = (not u["is_current"]) and u["inflight"] == 0
     for row in inflight:
         row["age_ms"] = int((now - row["started_at"]) * 1000)
+    waiting = [dict(w) for w in waiting]
+    for w in waiting:
+        w["age_ms"] = int((now - w["since"]) * 1000)
     for p in probes:
         p["detail"] = json.loads(p["detail"]) if p["detail"] else {}
     return {
@@ -225,5 +337,6 @@ def get_state() -> dict:
         "route": route,
         "upstreams": upstreams,
         "inflight": inflight,
+        "waiting": waiting,
         "recent_probes": probes,
     }

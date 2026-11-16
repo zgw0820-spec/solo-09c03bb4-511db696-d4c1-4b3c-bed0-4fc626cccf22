@@ -61,7 +61,8 @@ echo "== 阶段一：切换语义 =="
 SMOKE=$!
 
 # wait until phase1 has armed the to-be-interrupted in-flight request
-for _ in $(seq 1 300); do [ -f "$SAVE" ] && break; sleep 0.1; done
+# (phase1 now also exercises the quota scenarios, which takes ~40s)
+for _ in $(seq 1 1200); do [ -f "$SAVE" ] && break; sleep 0.1; done
 [ -f "$SAVE" ] || { echo "phase1 未到达重启点" >&2; exit 1; }
 
 GW_PID="${PIDS[-1]}"
